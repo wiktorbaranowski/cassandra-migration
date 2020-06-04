@@ -1,9 +1,10 @@
 package org.cognitor.cassandra.migration;
 
-import com.datastax.driver.core.*;
-import com.datastax.driver.core.exceptions.DriverException;
-import com.datastax.driver.core.exceptions.InvalidQueryException;
-
+import com.datastax.oss.driver.api.core.*;
+import com.datastax.oss.driver.api.core.cql.*;
+import com.datastax.oss.driver.api.core.metadata.Metadata;
+import com.datastax.oss.driver.api.core.metadata.schema.KeyspaceMetadata;
+import com.datastax.oss.driver.api.core.servererrors.InvalidQueryException;
 import org.cognitor.cassandra.migration.cql.SimpleCQLLexer;
 import org.cognitor.cassandra.migration.keyspace.Keyspace;
 import org.slf4j.Logger;
@@ -96,47 +97,44 @@ public class Database implements Closeable {
     private final String leaderTableName;
     private final String keyspaceName;
     private final Keyspace keyspace;
-    private final Cluster cluster;
-    private final Session session;
-    private ConsistencyLevel consistencyLevel = ConsistencyLevel.QUORUM;
+    private final CqlSession session;
+    private ConsistencyLevel consistencyLevel = DefaultConsistencyLevel.QUORUM;
     private final PreparedStatement logMigrationStatement;
     private final PreparedStatement takeMigrationLeadStatement;
     private final PreparedStatement releaseMigrationLeadStatement;
-    private final VersionNumber cassandraVersion;
+    private final Version cassandraVersion;
     private boolean tookLead = false;
 
-    public Database(Cluster cluster, Keyspace keyspace) {
-        this(cluster, keyspace, "");
+    public Database(CqlSession session, Keyspace keyspace) {
+        this(session, keyspace, "");
     }
 
-    public Database(Cluster cluster, Keyspace keyspace, String tablePrefix) {
-        this(cluster, keyspace, null, tablePrefix);
+    public Database(CqlSession session, Keyspace keyspace, String tablePrefix) {
+        this(session, keyspace, null, tablePrefix);
     }
 
     /**
      * Creates a new instance of the database.
      *
-     * @param cluster      the cluster that is connected to a cassandra instance
+     * @param session      the cluster that is connected to a cassandra instance
      * @param keyspaceName the keyspace name that will be managed by this instance
      */
-    public Database(Cluster cluster, String keyspaceName) {
-        this(cluster, keyspaceName, "");
+    public Database(CqlSession session, String keyspaceName) {
+        this(session, keyspaceName, "");
     }
 
-    public Database(Cluster cluster, String keyspaceName, String tablePrefix) {
-        this(cluster, null, keyspaceName, tablePrefix);
+    public Database(CqlSession session, String keyspaceName, String tablePrefix) {
+        this(session, null, keyspaceName, tablePrefix);
     }
 
-    private Database(Cluster cluster, Keyspace keyspace, String keyspaceName, String tablePrefix) {
-        this.cluster = notNull(cluster, "cluster");
+    private Database(CqlSession session, Keyspace keyspace, String keyspaceName, String tablePrefix) {
+        this.session = notNull(session, "session");
         this.keyspace = keyspace;
         this.keyspaceName = Optional.ofNullable(keyspace).map(Keyspace::getKeyspaceName).orElse(keyspaceName);
         this.tableName = createTableName(tablePrefix, SCHEMA_CF);
         this.leaderTableName = createTableName(tablePrefix, SCHEMA_LEADER_CF);
         createKeyspaceIfRequired();
-        session = cluster.connect(this.keyspaceName);
-        this.cassandraVersion = cluster.getMetadata().getAllHosts().stream().map(h -> h.getCassandraVersion())
-                .min(VersionNumber::compareTo).get();
+        this.cassandraVersion = getMinCassandraVersion(session);
         ensureSchemaTable();
         this.logMigrationStatement = session.prepare(format(INSERT_MIGRATION, getTableName()));
         this.takeMigrationLeadStatement = session.prepare(format(TAKE_LEAD_QUERY, getLeaderTableName(), LEAD_TTL));
@@ -151,6 +149,10 @@ public class Database implements Closeable {
         this.instanceAddress = tmpInstanceAddress;
     }
 
+    private Version getMinCassandraVersion(CqlSession session) {
+        return session.getMetadata().getNodes().values().stream().map(node -> node.getCassandraVersion()).min(Version::compareTo).get();
+    }
+
     private static String createTableName(String tablePrefix, String tableName) {
         if (tablePrefix == null || tablePrefix.isEmpty()) {
             return tableName;
@@ -162,7 +164,7 @@ public class Database implements Closeable {
         if (keyspace == null || keyspaceExists()) {
             return;
         }
-        try (Session session = this.cluster.connect()) {
+        try {
             session.execute(this.keyspace.getCqlStatement());
         } catch (DriverException exception) {
             throw new MigrationException(format("Unable to create keyspace %s.", keyspaceName), exception);
@@ -170,7 +172,7 @@ public class Database implements Closeable {
     }
 
     private boolean keyspaceExists() {
-        return cluster.getMetadata().getKeyspace(keyspace.getKeyspaceName()) != null;
+        return session.getMetadata().getKeyspace(keyspace.getKeyspaceName()) != null;
     }
 
     /**
@@ -190,7 +192,7 @@ public class Database implements Closeable {
      * @return the current schema version
      */
     public int getVersion() {
-        Statement getVersionQuery = new SimpleStatement(format(VERSION_QUERY, getTableName()))
+        Statement getVersionQuery = SimpleStatement.newInstance(format(VERSION_QUERY, getTableName()))
                 .setConsistencyLevel(this.consistencyLevel);
         ResultSet resultSet = session.execute(getVersionQuery);
         Row result = resultSet.one();
@@ -221,17 +223,18 @@ public class Database implements Closeable {
      * Makes sure the schema migration table exists. If it is not available it will be created.
      */
     private void ensureSchemaTable() {
-        if (schemaTablesIsNotExisting()) {
+        if (!schemaTablesIsExisting()) {
             createSchemaTable();
         }
     }
 
-    private boolean schemaTablesIsNotExisting() {
-        Metadata metadata = cluster.getMetadata();
-        KeyspaceMetadata keyspace = metadata.getKeyspace(keyspaceName);
-        TableMetadata table = keyspace.getTable(getTableName());
-        TableMetadata leaderTable = keyspace.getTable(getLeaderTableName());
-        return table == null || leaderTable == null;
+    private boolean schemaTablesIsExisting() {
+        Metadata metadata = session.getMetadata();
+        Optional<KeyspaceMetadata> keyspace = metadata.getKeyspace(keyspaceName);
+        return keyspace
+                .map(keyspaceMetadata -> keyspaceMetadata.getTable(getTableName())
+                        .isPresent())
+                .orElse(false);
     }
 
     private void createSchemaTable() {
@@ -272,7 +275,7 @@ public class Database implements Closeable {
 
     private void executeStatement(String statement, DbMigration migration) {
         if (!statement.isEmpty()) {
-            SimpleStatement simpleStatement = new SimpleStatement(statement);
+            SimpleStatement simpleStatement = SimpleStatement.newInstance(statement);
             simpleStatement.setConsistencyLevel(this.consistencyLevel);
             ResultSet resultSet = session.execute(simpleStatement);
             if (!resultSet.getExecutionInfo().isSchemaInAgreement()) {
@@ -387,7 +390,7 @@ public class Database implements Closeable {
      * @param cassandraVersion the version of Cassandra we're testing against
      * @return true if version is &gt;= 2.0, false if not
      */
-    public boolean isVersionAtLeastV2(VersionNumber cassandraVersion) {
-        return cassandraVersion.compareTo(VersionNumber.parse("2.0")) >= 0;
+    public boolean isVersionAtLeastV2(Version cassandraVersion) {
+        return cassandraVersion.compareTo(Version.parse("2.0")) >= 0;
     }
 }

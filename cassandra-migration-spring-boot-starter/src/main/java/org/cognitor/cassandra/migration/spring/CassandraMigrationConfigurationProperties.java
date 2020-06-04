@@ -1,6 +1,7 @@
 package org.cognitor.cassandra.migration.spring;
 
-import com.datastax.driver.core.ConsistencyLevel;
+import com.datastax.oss.driver.api.core.ConsistencyLevel;
+import com.datastax.oss.driver.api.core.DefaultConsistencyLevel;
 import org.cognitor.cassandra.migration.MigrationRepository;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -17,7 +18,7 @@ public class CassandraMigrationConfigurationProperties {
     private String scriptLocation = MigrationRepository.DEFAULT_SCRIPT_PATH;
     private String keyspaceName;
     private String tablePrefix = "";
-    private ConsistencyLevel consistencyLevel = ConsistencyLevel.QUORUM;
+    private ConsistencyLevel consistencyLevel = DefaultConsistencyLevel.QUORUM;
     private Boolean withConsensus = false;
 
     /**
